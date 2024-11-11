@@ -142,10 +142,17 @@ async function checkPosition(position) {
   // check if liquidation needed - step I
   try {
     const poolPrice = await getPoolPrice(position.poolAddress)
+    /* If position.liquidity is greater than 0, it calls the getAmounts function
+    with the parameters poolPrice.sqrtPriceX96, position.tickLower, position.tickUpper,
+    and position.liquidity to compute the amounts of token 0 and token 1.
+    If position.liquidity is not greater than 0,
+    it sets amounts to an object with amount0 and amount1 both initialized to zero.
+    */
     const amounts = position.liquidity.gt(0) ? getAmounts(poolPrice.sqrtPriceX96, position.tickLower, position.tickUpper, position.liquidity) : { amount0: BigNumber.from(0), amount1 : BigNumber.from(0) }
     amount0 = amounts.amount0.add(position.fees0)
     amount1 = amounts.amount1.add(position.fees1)
 
+    // Fetching the price with 2^96 format
     const price0X96 = await getTokenAssetPriceX96(position.token0, asset)
     const price1X96 = await getTokenAssetPriceX96(position.token1, asset)
 
@@ -153,14 +160,16 @@ async function checkPosition(position) {
     const collateralValue = assetValue.mul(position.collateralFactorX32).div(Q32)
     const debtValue = position.debtShares.mul(cachedExchangeRateX96).div(Q96)
 
+    // Debt > collateralValue
     if (debtValue.gt(collateralValue)) {
       // only call this once per minute to update position (&fees)
       if (!position.lastLiquidationCheck || position.lastLiquidationCheck + 60000 < Date.now()) {
-        info = await v3VaultContract.loanInfo(position.tokenId)
+        info = await v3VaultContract.loanInfo(position.tokenId) // TODO check what this function does
         position.lastLiquidationCheck = Date.now()
       }
     }
 
+    // It checks health factor of the position
     if (debtValue.gt(0) && (!position.lastLog || position.lastLog + positionLogInterval < Date.now())) {
       const factor = collateralValue.mul(100).div(debtValue).toNumber() / 100
       if (factor < 1.1) {
