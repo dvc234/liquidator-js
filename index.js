@@ -68,18 +68,18 @@ async function updatePosition(tokenId) {
     positions[tokenId].isUpdating = true
   }
 
-/*
-Debt Shares Check: It checks if a token (tokenId) has any associated debt shares.
-Updating Positions: If the debt shares are greater than 0:
-it fetches the position details like liquidity, ticks, fee, and associated tokens.
-Retrieves tick spacing based on the fee.
-Gets the pool address and owner of the token.
-Estimates current fees.
-Caches the token decimals and collateral factors if not already cached.
-Determines the collateral factor to be used.
-Updates the positions object.
-Deleting Positions: If there are no debt shares, it removes the tokenId from the positions.
-*/
+  /*
+  Debt Shares Check: It checks if a token (tokenId) has any associated debt shares.
+  Updating Positions: If the debt shares are greater than 0:
+  it fetches the position details like liquidity, ticks, fee, and associated tokens.
+  Retrieves tick spacing based on the fee.
+  Gets the pool address and owner of the token.
+  Estimates current fees.
+  Caches the token decimals and collateral factors if not already cached.
+  Determines the collateral factor to be used.
+  Updates the positions object.
+  Deleting Positions: If there are no debt shares, it removes the tokenId from the positions.
+  */
   try {
     const debtShares = await v3VaultContract.loans(tokenId)
     if (debtShares.gt(0)) {
@@ -164,6 +164,7 @@ async function checkPosition(position) {
     if (debtValue.gt(collateralValue)) {
       // only call this once per minute to update position (&fees)
       if (!position.lastLiquidationCheck || position.lastLiquidationCheck + 60000 < Date.now()) {
+        // it retrieves loan information
         info = await v3VaultContract.loanInfo(position.tokenId) // TODO check what this function does
         position.lastLiquidationCheck = Date.now()
       }
@@ -171,6 +172,7 @@ async function checkPosition(position) {
 
     // It checks health factor of the position
     if (debtValue.gt(0) && (!position.lastLog || position.lastLog + positionLogInterval < Date.now())) {
+      // collateralValue * 100 / debt / 100 --> factor = collateralValue / debt
       const factor = collateralValue.mul(100).div(debtValue).toNumber() / 100
       if (factor < 1.1) {
         const msg = `Low collateral factor ${factor.toFixed(2)} for ${getRevertUrlForDiscord(position.tokenId)} with debt ${ethers.utils.formatUnits(debtValue, assetDecimals)} ${assetSymbol}`
@@ -184,23 +186,38 @@ async function checkPosition(position) {
     info = null
   }
 
+  // TODO document liquidation
   if (info && info.liquidationValue.gt(0)) {
 
     // run liquidation - step II
     try {
       // amount that will be available to the contract - remove a bit for withdrawal slippage
+      // setup to remove 99,5% liquidity of the pair (i.e. ETH/USDT)
       const amount0Available = amount0.mul(995).div(1000).mul(info.liquidationValue).div(info.fullValue)
       const amount1Available = amount1.mul(995).div(1000).mul(info.liquidationValue).div(info.fullValue)
 
-      const deadline = Math.floor(Date.now() / 1000 + 1800)
+      const deadline = Math.floor(Date.now() / 1000 + 1800) // 3 mins deadline
 
-      // prepare swaps
+      /*
+      Prepare swap data for token0 if it's not the same asset
+      and there's an available amount.
+      This involves getting a quote from the Universal Router, storing the swap data,
+      and adding the involved pool addresses to the 'pools' array.
+       */
       let amount0In = BigNumber.from(0)
       let swapData0 = "0x"
       let pools = []
-      if (position.token0 != asset && amount0Available.gt(0)) {
-        amount0In = amount0Available
-        const quote = await quoteUniversalRouter(position.token0, asset, position.decimals0, assetDecimals, amount0In, floashLoanLiquidatorContract.address, 100, deadline, 0, ethers.constants.AddressZero)
+      // if there is liquidity and tokens are not the same
+      const liquidityPresent = amount0Available.gt(0);
+      const notTheSameAssets = position.token0 != asset;
+      const liquidityPresentAndTokensNotEqual = notTheSameAssets && liquidityPresent;
+      if (liquidityPresentAndTokensNotEqual) { // TODO check
+        amount0In = amount0Available // first token of the pair, i.e. ETH
+        const quote = await quoteUniversalRouter(
+            position.token0, asset, position.decimals0,
+            assetDecimals, amount0In, floashLoanLiquidatorContract.address,
+            100, deadline, 0, ethers.constants.AddressZero
+        )
         swapData0 = quote.data
         pools.push(...quote.pools.map(p => p.toLowerCase()))
       }
@@ -221,7 +238,7 @@ async function checkPosition(position) {
 
       const reward = info.liquidationValue.sub(info.liquidationCost)
 
-      const minReward = BigNumber.from(0) // 0% of reward must be recieved in assset after swaps and everything - rest in leftover token - no problem because flashloan liquidation
+      const minReward = BigNumber.from(0) // 0% of reward must be received in asset after swaps and everything - rest in leftover token - no problem because flashloan liquidation
 
       let params = {tokenId : position.tokenId, debtShares: position.debtShares, vault: v3VaultContract.address, flashLoanPool, amount0In, swapData0, amount1In, swapData1, minReward, deadline  }
 
@@ -294,13 +311,14 @@ async function run() {
 
   registerErrorHandler()
 
+  // asset is the instance of the contract contaning all the information, symbol, decimals, etc...
   asset = (await v3VaultContract.asset()).toLowerCase()
   assetDecimals = await getTokenDecimals(asset)
   assetSymbol = await getTokenSymbol(asset)
 
   await updateDebtExchangeRate()
 
-  // setup websockets for monitoring changes to positions
+  // setup websockets for monitoring changes to positions (add, remove, borrow, repay, withdraw, etc...)
   setupWebsocket([
       {
           filter: v3VaultContract.filters.Add(),
@@ -334,6 +352,7 @@ async function run() {
     ], async function(poolAddress) {
 
 
+    // TODO reduce the polling time
       const time = new Date()
       // every 5 minutes
       if (time.getTime() > lastWSLifeCheck + 300000) {
@@ -355,6 +374,7 @@ async function run() {
 
   setInterval(async () => { await updateDebtExchangeRate() }, 60000)
 
+  // TODO reduce the interval time
   // Set up regular interval checks
   const CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes in milliseconds
   setInterval(async () => {
