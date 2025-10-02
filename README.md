@@ -1,129 +1,109 @@
-# Liquidator-js
+# Liquidator-js for Revert Lend
 
-An open-source implementation of a simple liquidation bot for Revert Lend. This bot is designed to perform liquidations and also to serve as an example implementation for developers interested in building similar tools.
+This repository contains an open-source liquidation bot for the [Revert Lend](https://revert.finance/) protocol. It is designed to be a simple yet effective tool for liquidating undercollateralized positions, and also serves as a practical example for developers looking to build their own DeFi bots.
 
-## Overview
+## How It Works
 
-This bot monitors active positions on the Revert Lend protocol and executes liquidations when certain conditions are met. It uses a combination of WebSocket connections and periodic checks to stay updated on the state of the positions and the market.
+The bot continuously monitors positions on Revert Lend and automatically executes liquidations when a position's debt exceeds its collateral value.
 
-Key features:
+### Core Logic
 
-- **WebSocket Monitoring**: Listens to real-time events from the Uniswap contracts to update positions as their underlying value changes.
-- **Periodic Position Checks**: Regularly checks all positions at set intervals.
-- **Flashloan Liquidations**: Executes liquidations using flashloans, requiring no upfront capital in the asset being liquidated.
-- **Non-Flashloan Liquidations**: Optionally supports liquidations without flashloans if the liquidator holds the necessary USDC and has approved the V3Vault contract.
+1.  **Position Monitoring**:
+    *   On startup, the bot fetches all active positions.
+    *   It uses a WebSocket connection to listen for real-time blockchain events (e.g., `Swap`, `Add`, `Remove`, `Borrow`) that might affect position values.
+    *   When relevant events are detected, the affected positions are immediately re-checked.
 
-Revert Lend contract is currently deployed on Arbitrum only:
+2.  **Health Check**:
+    *   For each position, the bot calculates its health factor by comparing the value of its collateral against its outstanding debt.
+    *   A position is considered eligible for liquidation if its debt value is greater than its collateral value.
 
-- [Revert Lend Contract on Arbiscan](https://arbiscan.io/address/0x74e6afef5705beb126c6d3bf46f8fad8f3e07825)
+3.  **Liquidation Execution**:
+    *   When a position is identified for liquidation, the bot can use one of two methods:
+        *   **Flashloan Liquidation (Default)**: The bot borrows the required assets using a flashloan, executes the liquidation, and repays the loan in a single atomic transaction. This method does not require the liquidator to hold any upfront capital (other than ETH for gas).
+        *   **Non-Flashloan Liquidation**: If enabled, the bot can use its own funds to perform the liquidation. This requires the liquidator's wallet to be funded with the necessary assets (e.g., USDC) and to have approved the Revert Lend vault contract.
+
+4.  **Periodic Scans**:
+    *   In addition to real-time monitoring, the bot performs a full scan of all active positions every 15 minutes to catch any liquidation opportunities that might have been missed by event-based checks.
+
+## Project Structure
+
+The repository is organized as follows:
+
+-   `index.js`: The main entry point of the application. It contains the core logic for loading, checking, and liquidating positions.
+-   `lib/common.js`: A utility module containing helper functions for interacting with the blockchain, such as executing transactions, fetching contract data, and getting quotes from Uniswap.
+-   `contracts/`: Contains ABI files for the smart contracts the bot interacts with.
+-   `README.md`: You are here!
+-   `package.json`: Defines the project dependencies and scripts.
 
 ## Getting Started
 
+Follow these steps to set up and run the liquidator bot.
+
 ### Prerequisites
 
-- Node.js (v14 or higher)
-- npm (v6 or higher)
-- An Ethereum-compatible wallet with sufficient ETH on Arbitrum
-- Access to Arbitrum RPC endpoints (both HTTP and WebSocket)
+-   [Node.js](https://nodejs.org/) (v14 or higher)
+-   [npm](https://www.npmjs.com/) (v6 or higher)
+-   An Ethereum wallet with some ETH on Arbitrum to cover gas fees.
+-   Access to an Arbitrum RPC endpoint (both HTTP/S and WebSocket). You can get one from services like [Alchemy](https://www.alchemy.com/) or [Infura](https://www.infura.io/).
 
 ### Installation
 
-1. **Clone the Repository**
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/revert-finance/liquidator-js.git
+    cd liquidator-js
+    ```
 
-   ```bash
-   git clone https://github.com/revert-finance/liquidator-js.git
-   cd liquidator-js
-   ```
+2.  **Install dependencies:**
+    ```bash
+    npm install
+    ```
 
-2.	**Install Dependencies**
-   ```bash
-  	npm install
-   ```
+3.  **Create and configure your `.env` file:**
+    Create a file named `.env` in the root of the project and add the following environment variables:
 
-3. **Create a `.env` File**
+    ```dotenv
+    # Your wallet's private key.
+    PRIVATE_KEY_LIQUIDATOR=your_private_key_here
 
-   Before running the script, create a `.env` file in the root directory with the following configurations:
+    # Your Arbitrum RPC endpoint URL.
+    RPC_URL_ARBITRUM=https://arb-mainnet.g.alchemy.com/v2/your_api_key
 
-   ```dotenv
-   PRIVATE_KEY_LIQUIDATOR=your_private_key_here
-   RPC_URL_ARBITRUM=your_arbitrum_rpc_url_here
-   WS_RPC_URL_ARBITRUM=your_arbitrum_websocket_url_here
-   NETWORK=arbitrum
-   ```
+    # Your Arbitrum WebSocket endpoint URL.
+    WS_RPC_URL_ARBITRUM=wss://arb-mainnet.g.alchemy.com/v2/your_api_key
 
-4. **Optional: Non-Flashloan Liquidations**
+    # The network to run on.
+    NETWORK=arbitrum
+    ```
 
-   To enable non-flashloan liquidations:
-
-   - Deposit the required amount of USDC into your liquidator account.
-   - Approve the V3Vault contract to spend your USDC.
-
-     ```javascript
-     // Example approval script (ensure to customize token addresses and amounts)
-     const USDC_CONTRACT = new ethers.Contract(USDC_ADDRESS, IERC20_ABI, signer);
-     await USDC_CONTRACT.approve(V3_VAULT_ADDRESS, ethers.constants.MaxUint256);
-     ```
+    **Note:** The `PRIVATE_KEY_LIQUIDATOR` is used to sign and send transactions. Keep it secure and never commit it to version control.
 
 ## Running the Bot
 
-Start the bot by running:
+To start the liquidator bot, run the following command from the project's root directory:
 
 ```bash
 node index.js
 ```
 
-## How It Works
+The bot will start logging its activities to the console.
 
-### Monitoring Positions
+## Configuration
 
-The bot maintains an internal cache of active positions by:
+You can customize the bot's behavior by editing the constants at the top of `index.js`:
 
-- Loading all active positions on startup.
-- Listening to events (`Add`, `Remove`, `Borrow`, `Repay`, `WithdrawCollateral`, `IncreaseLiquidity`) to update positions in real-time.
-
-### Checking Positions
-
-Positions are checked for liquidation opportunities in two ways:
-
-1. **Event-Driven Checks**: When swap events on monitored uniswap pools are detected via WebSocket, the bot checks the affected positions immediately.
-2. **Periodic Checks**: Every 15 minutes, the bot performs a full scan of all positions to ensure no opportunities are missed with the swap events strategy.
-
-### Liquidation Process
-
-When a position is eligible for liquidation:
-
-- The bot estimates the liquidation value and prepares the necessary swap data using the Uniswap Universal Router.
-- **Flashloan Liquidations**: The bot uses a flashloan to perform the liquidation without needing upfront USDC.
-- **Non-Flashloan Liquidations**: If enabled, the bot can perform liquidations using its own USDC balance.
-
-
-## Configuration Options
-
-A few options can be configured in the `index.js` file:
-
-- `positionLogInterval`: Interval for logging low collateral factors (default is every 1 minute).
-- `enableNonFlashloanLiquidation`: Set to `true` to enable non-flashloan liquidations (default is `false`).
-- `CHECK_INTERVAL`: Interval for periodic position checks (default is every 15 minutes).
-
-## Important Notes
-
-- **Gas Fees**: Ensure your liquidator account has enough ETH on Arbitrum to cover gas fees.
-- **Security**: Keep your private keys secure. Do not share or commit them to version control.
-- **Dependencies**: The bot relies on several external services (e.g., RPC providers). Ensure your connections are reliable.
-
-## Additional Resources
-
-- **Revert Lend Documentation**: [Docs](https://docs.revert.finance/revert/revert-lend)
-
+-   `positionLogInterval`: How often to log positions with a low collateral factor (default: `60000` ms or 1 minute).
+-   `enableNonFlashloanLiquidation`: Set to `true` to use your own funds for liquidations instead of flashloans (default: `false`).
+-   `CHECK_INTERVAL`: The interval for periodic full scans of all positions (default: `900000` ms or 15 minutes).
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request for any improvements or bug fixes.
+Contributions are welcome! If you have suggestions for improvements or find a bug, please feel free to open an issue or submit a pull request.
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License. See the [LICENSE.txt](license.txt) file for details.
 
 ---
 
-*Disclaimer: Use this bot responsibly and at your own risk. The maintainers are not responsible for any financial losses incurred.*
+***Disclaimer:** This software is provided "as is", without warranty of any kind. Use it at your own risk. The authors or contributors are not responsible for any financial losses or other damages incurred from its use.*

@@ -23,18 +23,22 @@ let lastWSLifeCheck = new Date().getTime()
 
 let isCheckingAllPositions = false;
 
+/**
+ * Updates the debt exchange rate from the v3VaultContract.
+ */
 async function updateDebtExchangeRate() {
   const info = await v3VaultContract.vaultInfo()
   cachedExchangeRateX96 = info.debtExchangeRateX96
 }
 
-/*
-It retrieves all logs of positions being added and removed.
-It processes each add event from the newest to the oldest.
-For each add event, it checks if there is a corresponding remove event to determine if the position is still active.
-If the position is active, it updates the position and tracks the count of active positions.
-Finally, it logs the number of active positions loaded.
-*/
+/**
+ * Loads all active positions from the blockchain.
+ * It retrieves all logs of positions being added and removed.
+ * It processes each add event from the newest to the oldest.
+ * For each add event, it checks if there is a corresponding remove event to determine if the position is still active.
+ * If the position is active, it updates the position and tracks the count of active positions.
+ * Finally, it logs the number of active positions loaded.
+ */
 async function loadPositions() {
   let adds = await getAllLogs(v3VaultContract.filters.Add())
   let removes = await getAllLogs(v3VaultContract.filters.Remove())
@@ -54,7 +58,10 @@ async function loadPositions() {
 }
 
 
-// loads all needed data for position
+/**
+ * Updates the data for a specific position.
+ * @param {ethers.BigNumber} tokenId - The ID of the token representing the position.
+ */
 async function updatePosition(tokenId) {
   // if processing - retry later
   if (positions[tokenId] && (positions[tokenId].isChecking || positions[tokenId].isExecuting || positions[tokenId].isUpdating)) {
@@ -129,7 +136,10 @@ async function updatePosition(tokenId) {
   }
 }
 
-// checks position
+/**
+ * Checks a position to determine if it needs to be liquidated.
+ * @param {object} position - The position object to check.
+ */
 async function checkPosition(position) {
 
   if (!position || position.isChecking || position.isExecuting || position.isUpdating) {
@@ -286,6 +296,9 @@ async function checkPosition(position) {
   position.isChecking = false
 }
 
+/**
+ * Checks all positions to determine if they need to be liquidated.
+ */
 async function checkAllPositions() {
   if (isCheckingAllPositions) {
     logWithTimestamp("Regular check of all positions is already in progress. Skipping this execution.");
@@ -307,6 +320,9 @@ async function checkAllPositions() {
   }
 }
 
+/**
+ * The main function of the application.
+ */
 async function run() {
 
   registerErrorHandler()
