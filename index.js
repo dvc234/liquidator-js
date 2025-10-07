@@ -1,27 +1,43 @@
+/**
+ * Liquidator Bot for Revert Lend
+ * 
+ * This bot monitors Uniswap V3 positions that are used as collateral in the Revert Lend protocol
+ * and automatically liquidates undercollateralized positions to maintain protocol solvency.
+ * 
+ * @module liquidator-js
+ * @requires dotenv - Environment variable management
+ * @requires ethers - Ethereum library for blockchain interactions
+ * @requires ./lib/common - Common utility functions and blockchain helpers
+ */
+
 require('dotenv').config()
 const { ethers, BigNumber } = require('ethers')
-const { logWithTimestamp} = require('./lib/common')
+const { logWithTimestamp } = require('./lib/common')
 const { quoteUniversalRouter, registerErrorHandler, npmContract, provider, signer, setupWebsocket,
-        getPool, getAllLogs, getPoolPrice, getAmounts, getTokenAssetPriceX96,
-        getTickSpacing, getFlashloanPoolOptions, getV3VaultAddress, getFlashLoanLiquidatorAddress,
-        executeTx, getTokenDecimals, getTokenSymbol, getPoolToToken,
-        getRevertUrlForDiscord, getExplorerUrlForDiscord, Q32, Q96 } = require('./lib/common')
+  getPool, getAllLogs, getPoolPrice, getAmounts, getTokenAssetPriceX96,
+  getTickSpacing, getFlashloanPoolOptions, getV3VaultAddress, getFlashLoanLiquidatorAddress,
+  executeTx, getTokenDecimals, getTokenSymbol, getPoolToToken,
+  getRevertUrlForDiscord, getExplorerUrlForDiscord, Q32, Q96 } = require('./lib/common')
 
+// Contract instances
 const v3VaultContract = new ethers.Contract(getV3VaultAddress(), require("./contracts/V3Vault.json").abi, provider)
 const floashLoanLiquidatorContract = new ethers.Contract(getFlashLoanLiquidatorAddress(), require("./contracts/FlashloanLiquidator.json").abi, provider)
 
-const positionLogInterval = 1 * 6000 // log positions each 1 min
-const enableNonFlashloanLiquidation = false
+// Configuration constants
+const positionLogInterval = 1 * 6000 // Log positions each 1 minute (in milliseconds)
+const enableNonFlashloanLiquidation = false // Fallback to non-flashloan liquidation if flashloan fails
 
-const positions = {}
-const cachedTokenDecimals = {}
-const cachedCollateralFactorX32 = {}
+// State management
+const positions = {} // Stores all active positions being monitored
+const cachedTokenDecimals = {} // Cache for token decimal values to reduce RPC calls
+const cachedCollateralFactorX32 = {} // Cache for collateral factors (Q32 format)
 
-let cachedExchangeRateX96
-let asset, assetDecimals, assetSymbol
-let lastWSLifeCheck = new Date().getTime()
+// Global variables
+let cachedExchangeRateX96 // Current debt exchange rate in Q96 format
+let asset, assetDecimals, assetSymbol // Asset token information (e.g., USDC)
+let lastWSLifeCheck = new Date().getTime() // Timestamp of last WebSocket health check
 
-let isCheckingAllPositions = false;
+let isCheckingAllPositions = false; // Flag to prevent concurrent position checks
 
 /**
  * Updates the debt exchange rate from the v3VaultContract.
@@ -45,14 +61,14 @@ async function loadPositions() {
   let loadedPositions = 0
   // from newest to oldest - process each event once - remove deactivated positions
   while (adds.length > 0) {
-      const event = adds[adds.length - 1]
-      const tokenId = v3VaultContract.interface.parseLog(event).args.tokenId
-      const isActive = removes.filter(e => tokenId.eq(v3VaultContract.interface.parseLog(e).args.tokenId) && (e.blockNumber > event.blockNumber || (e.blockNumber == event.blockNumber && e.logIndex > event.logIndex))).length === 0
-      if (isActive) {
-        await updatePosition(tokenId)
-        loadedPositions++
-      }
-      adds = adds.filter(e => !v3VaultContract.interface.parseLog(e).args.tokenId.eq(tokenId))
+    const event = adds[adds.length - 1]
+    const tokenId = v3VaultContract.interface.parseLog(event).args.tokenId
+    const isActive = removes.filter(e => tokenId.eq(v3VaultContract.interface.parseLog(e).args.tokenId) && (e.blockNumber > event.blockNumber || (e.blockNumber == event.blockNumber && e.logIndex > event.logIndex))).length === 0
+    if (isActive) {
+      await updatePosition(tokenId)
+      loadedPositions++
+    }
+    adds = adds.filter(e => !v3VaultContract.interface.parseLog(e).args.tokenId.eq(tokenId))
   }
   logWithTimestamp(`Loaded ${loadedPositions} active positions`)
 }
@@ -65,7 +81,7 @@ async function loadPositions() {
 async function updatePosition(tokenId) {
   // if processing - retry later
   if (positions[tokenId] && (positions[tokenId].isChecking || positions[tokenId].isExecuting || positions[tokenId].isUpdating)) {
-    setTimeout(async() => await updatePosition(tokenId), 10000)
+    setTimeout(async () => await updatePosition(tokenId), 10000)
     return
   }
 
@@ -125,9 +141,9 @@ async function updatePosition(tokenId) {
     } else {
       delete positions[tokenId]
     }
-  } catch(err) {
+  } catch (err) {
     // retry on error after 1 min
-    setTimeout(async() => await updatePosition(tokenId), 60000)
+    setTimeout(async () => await updatePosition(tokenId), 60000)
     logWithTimestamp("Error updating position " + tokenId.toString(), err)
   }
 
@@ -138,7 +154,25 @@ async function updatePosition(tokenId) {
 
 /**
  * Checks a position to determine if it needs to be liquidated.
- * @param {object} position - The position object to check.
+ * 
+ * This function performs a two-step liquidation check:
+ * Step I: Estimates if liquidation is needed based on collateral vs debt value
+ * Step II: If liquidation is needed, prepares and executes the liquidation transaction
+ * 
+ * The liquidation process:
+ * 1. Calculates the current value of the position's tokens
+ * 2. Compares collateral value (adjusted by collateral factor) against debt value
+ * 3. If undercollateralized, prepares swap routes to convert tokens to the asset
+ * 4. Executes liquidation using flashloan (or direct liquidation as fallback)
+ * 
+ * @param {object} position - The position object to check containing:
+ *   - tokenId: The NFT token ID representing the position
+ *   - liquidity: Current liquidity in the position
+ *   - tickLower/tickUpper: Price range boundaries
+ *   - token0/token1: Token addresses in the pool
+ *   - debtShares: Amount of debt shares
+ *   - collateralFactorX32: Collateral factor in Q32 format
+ *   - fees0/fees1: Accumulated fees
  */
 async function checkPosition(position) {
 
@@ -149,7 +183,7 @@ async function checkPosition(position) {
 
   let info, amount0, amount1
 
-  // check if liquidation needed - step I
+  // Step I: Check if liquidation is needed
   try {
     const poolPrice = await getPoolPrice(position.poolAddress)
     /* If position.liquidity is greater than 0, it calls the getAmounts function
@@ -158,7 +192,7 @@ async function checkPosition(position) {
     If position.liquidity is not greater than 0,
     it sets amounts to an object with amount0 and amount1 both initialized to zero.
     */
-    const amounts = position.liquidity.gt(0) ? getAmounts(poolPrice.sqrtPriceX96, position.tickLower, position.tickUpper, position.liquidity) : { amount0: BigNumber.from(0), amount1 : BigNumber.from(0) }
+    const amounts = position.liquidity.gt(0) ? getAmounts(poolPrice.sqrtPriceX96, position.tickLower, position.tickUpper, position.liquidity) : { amount0: BigNumber.from(0), amount1: BigNumber.from(0) }
     amount0 = amounts.amount0.add(position.fees0)
     amount1 = amounts.amount1.add(position.fees1)
 
@@ -196,10 +230,10 @@ async function checkPosition(position) {
     info = null
   }
 
-  // TODO document liquidation
+  // Step II: Execute liquidation if position is undercollateralized
   if (info && info.liquidationValue.gt(0)) {
 
-    // run liquidation - step II
+    // Prepare and execute liquidation transaction
     try {
       // amount that will be available to the contract - remove a bit for withdrawal slippage
       // setup to remove 99,5% liquidity of the pair (i.e. ETH/USDT)
@@ -209,29 +243,36 @@ async function checkPosition(position) {
       const deadline = Math.floor(Date.now() / 1000 + 1800) // 3 mins deadline
 
       /*
-      Prepare swap data for token0 if it's not the same asset
-      and there's an available amount.
-      This involves getting a quote from the Universal Router, storing the swap data,
-      and adding the involved pool addresses to the 'pools' array.
+       * Prepare swap routes to convert position tokens to the asset token (e.g., USDC)
+       * 
+       * For each token in the position that differs from the asset:
+       * 1. Get a quote from Uniswap's Universal Router for the optimal swap route
+       * 2. Store the swap calldata
+       * 3. Track all pools involved in the swap to avoid using them for flashloans
+       * 
+       * This ensures we can convert the liquidated collateral to the debt asset
+       * to repay the loan and capture any liquidation reward.
        */
       let amount0In = BigNumber.from(0)
       let swapData0 = "0x"
       let pools = []
-      // if there is liquidity and tokens are not the same
+
+      // Prepare swap for token0 if it's not the asset token
       const liquidityPresent = amount0Available.gt(0);
       const notTheSameAssets = position.token0 != asset;
       const liquidityPresentAndTokensNotEqual = notTheSameAssets && liquidityPresent;
-      if (liquidityPresentAndTokensNotEqual) { // TODO check
-        amount0In = amount0Available // first token of the pair, i.e. ETH
+      if (liquidityPresentAndTokensNotEqual) {
+        amount0In = amount0Available
         const quote = await quoteUniversalRouter(
-            position.token0, asset, position.decimals0,
-            assetDecimals, amount0In, floashLoanLiquidatorContract.address,
-            100, deadline, 0, ethers.constants.AddressZero
+          position.token0, asset, position.decimals0,
+          assetDecimals, amount0In, floashLoanLiquidatorContract.address,
+          100, deadline, 0, ethers.constants.AddressZero
         )
         swapData0 = quote.data
         pools.push(...quote.pools.map(p => p.toLowerCase()))
       }
 
+      // Prepare swap for token1 if it's not the asset token
       let amount1In = BigNumber.from(0)
       let swapData1 = "0x"
       if (position.token1 != asset && amount1Available.gt(0)) {
@@ -243,46 +284,52 @@ async function checkPosition(position) {
 
       pools.push(position.poolAddress)
 
+      // Select a flashloan pool that's not involved in the swap routes
+      // This prevents circular dependencies and ensures the flashloan can be executed
       const flashLoanPoolOptions = getFlashloanPoolOptions(asset)
       const flashLoanPool = flashLoanPoolOptions.filter(o => !pools.includes(o.toLowerCase()))[0]
 
       const reward = info.liquidationValue.sub(info.liquidationCost)
 
-      const minReward = BigNumber.from(0) // 0% of reward must be received in asset after swaps and everything - rest in leftover token - no problem because flashloan liquidation
+      // Minimum reward threshold (set to 0 for flashloan liquidation since we don't risk our own capital)
+      const minReward = BigNumber.from(0)
 
-      let params = {tokenId : position.tokenId, debtShares: position.debtShares, vault: v3VaultContract.address, flashLoanPool, amount0In, swapData0, amount1In, swapData1, minReward, deadline  }
+      // Prepare liquidation parameters
+      let params = { tokenId: position.tokenId, debtShares: position.debtShares, vault: v3VaultContract.address, flashLoanPool, amount0In, swapData0, amount1In, swapData1, minReward, deadline }
 
       let useFlashloan = true
       let gasLimit
       try {
+        // Estimate gas for flashloan liquidation
         gasLimit = await floashLoanLiquidatorContract.connect(signer).estimateGas.liquidate(params)
       } catch (err) {
         logWithTimestamp("Error trying flashloan liquidation for " + position.tokenId.toString(), err)
 
         if (enableNonFlashloanLiquidation) {
-          // if there is any error with liquidation - fallback to non-flashloan liquidation
+          // Fallback to direct liquidation (requires liquidator to have the asset tokens)
           useFlashloan = false
-          params = { tokenId : position.tokenId, amount0Min: BigNumber.from(0), amount1Min: BigNumber.from(0), recipient: signer.address, permitData: "0x", deadline}
+          params = { tokenId: position.tokenId, amount0Min: BigNumber.from(0), amount1Min: BigNumber.from(0), recipient: signer.address, permitData: "0x", deadline }
           gasLimit = await v3VaultContract.connect(signer).estimateGas.liquidate(params)
         } else {
           throw err
         }
       }
 
+      // Build transaction with 25% gas buffer to account for price changes
       const tx = useFlashloan ?
-                    await floashLoanLiquidatorContract.populateTransaction.liquidate(params, { gasLimit: gasLimit.mul(125).div(100) }) :
-                    await v3VaultContract.populateTransaction.liquidate(params, { gasLimit: gasLimit.mul(125).div(100) })
+        await floashLoanLiquidatorContract.populateTransaction.liquidate(params, { gasLimit: gasLimit.mul(125).div(100) }) :
+        await v3VaultContract.populateTransaction.liquidate(params, { gasLimit: gasLimit.mul(125).div(100) })
 
       position.isExecuting = true
       const { hash, error } = await executeTx(tx, async (success) => {
-          position.isExecuting = false
+        position.isExecuting = false
       })
 
       if (hash) {
-          const msg = `Executing liquidation ${useFlashloan ? "with" : "without" } flashloan for ${getRevertUrlForDiscord(position.tokenId)} with reward of ${ethers.utils.formatUnits(reward, assetDecimals)} ${assetSymbol} - ${getExplorerUrlForDiscord(hash)}`
-          logWithTimestamp(msg)
+        const msg = `Executing liquidation ${useFlashloan ? "with" : "without"} flashloan for ${getRevertUrlForDiscord(position.tokenId)} with reward of ${ethers.utils.formatUnits(reward, assetDecimals)} ${assetSymbol} - ${getExplorerUrlForDiscord(hash)}`
+        logWithTimestamp(msg)
       } else {
-          throw error
+        throw error
       }
     } catch (err) {
       logWithTimestamp("Error liquidating position " + position.tokenId.toString(), err)
@@ -321,87 +368,99 @@ async function checkAllPositions() {
 }
 
 /**
- * The main function of the application.
+ * Main entry point for the liquidator bot.
+ * 
+ * Initialization sequence:
+ * 1. Sets up error handlers for uncaught exceptions
+ * 2. Loads asset token information from the V3 Vault
+ * 3. Fetches the current debt exchange rate
+ * 4. Sets up WebSocket listeners for real-time position updates
+ * 5. Loads all existing positions from blockchain history
+ * 6. Starts periodic tasks (exchange rate updates, position checks)
+ * 
+ * The bot then runs continuously, monitoring positions and executing liquidations as needed.
  */
 async function run() {
 
   registerErrorHandler()
 
-  // asset is the instance of the contract contaning all the information, symbol, decimals, etc...
+  // Load asset token information (the token used for lending, e.g., USDC)
   asset = (await v3VaultContract.asset()).toLowerCase()
   assetDecimals = await getTokenDecimals(asset)
   assetSymbol = await getTokenSymbol(asset)
 
   await updateDebtExchangeRate()
 
-  // setup websockets for monitoring changes to positions (add, remove, borrow, repay, withdraw, etc...)
+  // Setup WebSocket listeners for real-time monitoring of position changes
   setupWebsocket([
-      {
-          filter: v3VaultContract.filters.Add(),
-          handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
-      },
-      {
-          filter: v3VaultContract.filters.Remove(),
-          handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
-      },
-      {
-          filter: v3VaultContract.filters.Borrow(),
-          handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
-      },
-      {
-          filter: v3VaultContract.filters.Repay(),
-          handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
-      },
-      {
-          filter: v3VaultContract.filters.WithdrawCollateral(),
-          handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
-      },
-      {
-          filter: npmContract.filters.IncreaseLiquidity(),
-          handler: async (e) => {
-            const tokenId = npmContract.interface.parseLog(e).args.tokenId
-            if (positions[tokenId]) {
-              await updatePosition(tokenId)
-            }
-          }
-      }
-    ], async function(poolAddress) {
-
-
-    // TODO reduce the polling time
-      const time = new Date()
-      // every 5 minutes
-      if (time.getTime() > lastWSLifeCheck + 300000) {
-          logWithTimestamp("WS Live check", time.toISOString())
-          lastWSLifeCheck = time.getTime()
-      }
-
-      // if price reference pool price changed - check all positions with affected token
-      const affectedToken = getPoolToToken(asset, poolAddress)
-      if (affectedToken) {
-        const toCheckPositions = Object.values(positions).filter(p => p.token0 === affectedToken ||  p.token1 === affectedToken)
-        for (const position of toCheckPositions) {
-            await checkPosition(position)
+    {
+      filter: v3VaultContract.filters.Add(),
+      handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
+    },
+    {
+      filter: v3VaultContract.filters.Remove(),
+      handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
+    },
+    {
+      filter: v3VaultContract.filters.Borrow(),
+      handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
+    },
+    {
+      filter: v3VaultContract.filters.Repay(),
+      handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
+    },
+    {
+      filter: v3VaultContract.filters.WithdrawCollateral(),
+      handler: async (e) => { await updatePosition(v3VaultContract.interface.parseLog(e).args.tokenId) }
+    },
+    {
+      filter: npmContract.filters.IncreaseLiquidity(),
+      handler: async (e) => {
+        const tokenId = npmContract.interface.parseLog(e).args.tokenId
+        if (positions[tokenId]) {
+          await updatePosition(tokenId)
         }
       }
+    }
+  ], async function (poolAddress) {
+
+    // WebSocket health check every 5 minutes
+    const time = new Date()
+    if (time.getTime() > lastWSLifeCheck + 300000) {
+      logWithTimestamp("WS Live check", time.toISOString())
+      lastWSLifeCheck = time.getTime()
+    }
+
+    // When a price reference pool changes, check all positions containing that token
+    // This ensures we quickly detect positions that may have become undercollateralized
+    const affectedToken = getPoolToToken(asset, poolAddress)
+    if (affectedToken) {
+      const toCheckPositions = Object.values(positions).filter(p => p.token0 === affectedToken || p.token1 === affectedToken)
+      for (const position of toCheckPositions) {
+        await checkPosition(position)
+      }
+    }
   })
 
   await loadPositions()
 
+  // Update debt exchange rate every minute
   setInterval(async () => { await updateDebtExchangeRate() }, 60000)
 
-  // TODO reduce the interval time
-  // Set up regular interval checks
+  // Perform comprehensive check of all positions every 15 minutes
+  // This acts as a safety net in case any WebSocket events were missed
   const CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes in milliseconds
   setInterval(async () => {
     await checkAllPositions();
   }, CHECK_INTERVAL);
 
+  // Graceful shutdown handler
   process.on('SIGINT', () => {
     logWithTimestamp('Received SIGINT. Shutting down gracefully...');
-    // Close any open connections, stop any ongoing operations
     process.exit(0);
   });
 }
+
+// Start the bot
 
 run()
